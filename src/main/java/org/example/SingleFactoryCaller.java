@@ -45,7 +45,6 @@ public class SingleFactoryCaller<T> {
                     }
                     return future;
                 } catch (Exception e) {
-                    // Wrap any synchronous exception in a failed CompletableFuture
                     return CompletableFuture.failedFuture(e);
                 }
             })
@@ -93,7 +92,7 @@ public class SingleFactoryCaller<T> {
         private volatile Exception exception;
         private volatile boolean initialized = false;
         private final Object lock = new Object();
-        private final Supplier<T> supplier;
+        private volatile Supplier<T> supplier; // Make volatile and allow nulling for GC
 
         public Lazy(Supplier<T> supplier) {
             if (supplier == null) {
@@ -103,20 +102,31 @@ public class SingleFactoryCaller<T> {
         }
 
         public T getValue() throws Exception {
-            if (!initialized) {
-                synchronized (lock) {
-                    if (!initialized) {
-                        try {
-                            value = supplier.get();
-                        } catch (Exception e) {
-                            exception = e;
-                        } finally {
-                            initialized = true;
-                        }
+            // First check - no synchronization needed for the happy path
+            if (initialized) {
+                if (exception != null) {
+                    throw exception;
+                }
+                return value;
+            }
+            
+            // Double-checked locking with proper exception handling
+            synchronized (lock) {
+                if (!initialized) {
+                    try {
+                        value = supplier.get();
+                        // Clear supplier reference to help with GC
+                        supplier = null;
+                    } catch (Exception e) {
+                        exception = e;
+                        supplier = null; // Clear reference even on failure
+                    } finally {
+                        initialized = true;
                     }
                 }
             }
             
+            // Re-check after synchronization
             if (exception != null) {
                 throw exception;
             }
