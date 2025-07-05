@@ -44,8 +44,14 @@ public class SingleFactoryCaller<T> {
                         );
                     }
                     return future;
-                } catch (Exception e) {
+                } catch (RuntimeException e) {
+                    // Don't double-wrap RuntimeExceptions
                     return CompletableFuture.failedFuture(e);
+                } catch (Exception e) {
+                    // Wrap checked exceptions
+                    return CompletableFuture.failedFuture(
+                        new RuntimeException("Factory execution failed", e)
+                    );
                 }
             })
         );
@@ -53,7 +59,7 @@ public class SingleFactoryCaller<T> {
         CompletableFuture<T> future;
         try {
             future = lazyValue.getValue();
-        } catch (Exception e) {
+        } catch (RuntimeException e) {
             // If lazy initialization fails, remove the failed entry and create a failed future
             pendingTasks.remove(key, lazyValue);
             return CompletableFuture.failedFuture(e);
@@ -89,7 +95,7 @@ public class SingleFactoryCaller<T> {
      */
     private static class Lazy<T> {
         private volatile T value;
-        private volatile Exception exception;
+        private volatile RuntimeException exception;
         private volatile boolean initialized = false;
         private final Object lock = new Object();
         private volatile Supplier<T> supplier; // Make volatile and allow nulling for GC
@@ -101,11 +107,11 @@ public class SingleFactoryCaller<T> {
             this.supplier = supplier;
         }
 
-        public T getValue() throws Exception {
+        public T getValue() {
             // First check - no synchronization needed for the happy path
             if (initialized) {
                 if (exception != null) {
-                    throw exception;
+                    throw new RuntimeException("Lazy initialization failed", exception);
                 }
                 return value;
             }
@@ -117,8 +123,13 @@ public class SingleFactoryCaller<T> {
                         value = supplier.get();
                         // Clear supplier reference to help with GC
                         supplier = null;
-                    } catch (Exception e) {
+                    } catch (RuntimeException e) {
+                        // Store runtime exceptions directly
                         exception = e;
+                        supplier = null; // Clear reference even on failure
+                    } catch (Exception e) {
+                        // Wrap checked exceptions in RuntimeException
+                        exception = new RuntimeException("Lazy initialization failed", e);
                         supplier = null; // Clear reference even on failure
                     } finally {
                         initialized = true;
@@ -128,7 +139,7 @@ public class SingleFactoryCaller<T> {
             
             // Re-check after synchronization
             if (exception != null) {
-                throw exception;
+                throw new RuntimeException("Lazy initialization failed", exception);
             }
             
             return value;
