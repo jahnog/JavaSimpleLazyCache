@@ -5,144 +5,84 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
 /**
- * A thread-safe cache that ensures only one factory call per key is executed concurrently.
- * This prevents duplicate expensive operations for the same key.
- * 
- * IMPROVED VERSION with proper exception handling.
+ * Runs at most one factory per key while that call is in flight.
  *
- * @param <T> The type of value to cache (must be a reference type)
+ * <p>Callers that ask for the same key before the call finishes share one
+ * future. The key is removed when that future completes, successfully or
+ * not, so the next call runs the factory again. Results are not retained.
+ *
+ * <p>The factory should return a future promptly and do slow work inside it.
+ * A throw, including an {@link Error}, or a null return becomes a failed
+ * future. The method itself still returns that future.
+ *
+ * @param <T> the value produced by the factory
  */
-public class SingleFactoryCaller<T> {
-    private final ConcurrentHashMap<String, Lazy<CompletableFuture<T>>> pendingTasks 
-        = new ConcurrentHashMap<>();
+public final class SingleFactoryCaller<T> {
+    private final ConcurrentHashMap<String, CompletableFuture<T>> pendingTasks = new ConcurrentHashMap<>();
 
     /**
-     * Gets or adds a value asynchronously using the provided factory function.
-     * If multiple threads request the same key simultaneously, only one factory call will be made.
+     * Returns the in-flight future for {@code key}, starting {@code valueFactory}
+     * when no call for that key is already running.
      *
-     * @param key The cache key
-     * @param valueFactory The factory function to create the value if not present
-     * @return A CompletableFuture containing the cached or newly created value
-     * @throws IllegalArgumentException if the key is null or empty, or if valueFactory is null
+     * @param key          cache key; null, empty, and whitespace-only keys are rejected
+     * @param valueFactory produces the future for a new call; must not be null
+     * @return the shared future for this in-flight call
+     * @throws IllegalArgumentException if {@code key} is null or blank, or if {@code valueFactory} is null
      */
     public CompletableFuture<T> getOrAddAsync(String key, Supplier<CompletableFuture<T>> valueFactory) {
         if (key == null || key.trim().isEmpty()) {
             throw new IllegalArgumentException("Key cannot be null or empty.");
         }
-        
         if (valueFactory == null) {
             throw new IllegalArgumentException("ValueFactory cannot be null.");
         }
 
-        Lazy<CompletableFuture<T>> lazyValue = pendingTasks.computeIfAbsent(key, k ->
-            new Lazy<>(() -> {
-                try {
-                    CompletableFuture<T> future = valueFactory.get();
-                    if (future == null) {
-                        return CompletableFuture.failedFuture(
-                            new IllegalStateException("ValueFactory returned null CompletableFuture")
-                        );
-                    }
-                    return future;
-                } catch (RuntimeException e) {
-                    // Don't double-wrap RuntimeExceptions
-                    return CompletableFuture.failedFuture(e);
-                } catch (Exception e) {
-                    // Wrap checked exceptions
-                    return CompletableFuture.failedFuture(
-                        new RuntimeException("Factory execution failed", e)
-                    );
-                }
-            })
-        );
-
-        CompletableFuture<T> future;
-        try {
-            future = lazyValue.getValue();
-        } catch (RuntimeException e) {
-            // If lazy initialization fails, remove the failed entry and create a failed future
-            pendingTasks.remove(key, lazyValue);
-            return CompletableFuture.failedFuture(e);
+        CompletableFuture<T> created = new CompletableFuture<>();
+        CompletableFuture<T> existing = pendingTasks.putIfAbsent(key, created);
+        if (existing != null) {
+            return existing;
         }
-        
-        // Remove the key from pending tasks when the future completes (either successfully or exceptionally)
-        return future.whenComplete((result, throwable) -> {
-            pendingTasks.remove(key, lazyValue);
+
+        CompletableFuture<T> produced = invoke(valueFactory);
+        produced.whenComplete((value, error) -> {
+            // Drop the key before completing. complete() runs dependents inline,
+            // and those dependents must not observe the finished call.
+            pendingTasks.remove(key, created);
+            if (error == null) {
+                created.complete(value);
+            } else {
+                created.completeExceptionally(error);
+            }
         });
+        return created;
     }
 
     /**
-     * Clears all pending tasks. Useful for testing or cleanup.
+     * Drops every in-flight entry. Futures already handed to callers still complete.
      */
     public void clear() {
         pendingTasks.clear();
     }
 
     /**
-     * Returns the number of pending tasks.
+     * Returns the number of keys with a call still in flight.
+     *
      * @return the number of keys currently being processed
      */
     public int getPendingTasksCount() {
         return pendingTasks.size();
     }
 
-    /**
-     * A thread-safe lazy initialization wrapper with improved exception handling.
-     * Ensures that the supplier is called only once, even in concurrent scenarios.
-     * If the supplier throws an exception, subsequent calls will also throw the same exception.
-     *
-     * @param <T> The type of value to lazily initialize
-     */
-    private static class Lazy<T> {
-        private volatile T value;
-        private volatile RuntimeException exception;
-        private volatile boolean initialized = false;
-        private final Object lock = new Object();
-        private volatile Supplier<T> supplier; // Make volatile and allow nulling for GC
-
-        public Lazy(Supplier<T> supplier) {
-            if (supplier == null) {
-                throw new IllegalArgumentException("Supplier cannot be null.");
+    private static <T> CompletableFuture<T> invoke(Supplier<CompletableFuture<T>> valueFactory) {
+        try {
+            CompletableFuture<T> produced = valueFactory.get();
+            if (produced == null) {
+                return CompletableFuture.failedFuture(
+                        new IllegalStateException("ValueFactory returned null CompletableFuture"));
             }
-            this.supplier = supplier;
-        }
-
-        public T getValue() {
-            // First check - no synchronization needed for the happy path
-            if (initialized) {
-                if (exception != null) {
-                    throw new RuntimeException("Lazy initialization failed", exception);
-                }
-                return value;
-            }
-            
-            // Double-checked locking with proper exception handling
-            synchronized (lock) {
-                if (!initialized) {
-                    try {
-                        value = supplier.get();
-                        // Clear supplier reference to help with GC
-                        supplier = null;
-                    } catch (RuntimeException e) {
-                        // Store runtime exceptions directly
-                        exception = e;
-                        supplier = null; // Clear reference even on failure
-                    } catch (Exception e) {
-                        // Wrap checked exceptions in RuntimeException
-                        exception = new RuntimeException("Lazy initialization failed", e);
-                        supplier = null; // Clear reference even on failure
-                    } finally {
-                        initialized = true;
-                    }
-                }
-            }
-            
-            // Re-check after synchronization
-            if (exception != null) {
-                throw new RuntimeException("Lazy initialization failed", exception);
-            }
-            
-            return value;
+            return produced;
+        } catch (Throwable thrown) {
+            return CompletableFuture.failedFuture(thrown);
         }
     }
 }
