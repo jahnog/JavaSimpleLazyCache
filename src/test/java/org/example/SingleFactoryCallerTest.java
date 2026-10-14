@@ -23,6 +23,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -103,6 +104,38 @@ class SingleFactoryCallerTest {
             String value = await(cache.getOrAddAsync(key, () -> CompletableFuture.completedFuture("ok")));
 
             assertEquals("ok", value);
+        }
+
+        @Test
+        void rejectedBlankKeyLeavesInFlightEntry() throws Exception {
+            CompletableFuture<String> gate = new CompletableFuture<>();
+            CompletableFuture<String> inFlight = cache.getOrAddAsync("key", () -> gate);
+
+            IllegalArgumentException exception = assertThrows(
+                    IllegalArgumentException.class,
+                    () -> cache.getOrAddAsync(" ", () -> CompletableFuture.completedFuture("other")));
+
+            assertEquals("Key cannot be null or empty.", exception.getMessage());
+            assertEquals(1, cache.getPendingTasksCount());
+            assertFalse(inFlight.isDone());
+            gate.complete("value");
+            assertEquals("value", await(inFlight));
+        }
+
+        @Test
+        void rejectedNullFactoryLeavesInFlightEntry() throws Exception {
+            CompletableFuture<String> gate = new CompletableFuture<>();
+            CompletableFuture<String> inFlight = cache.getOrAddAsync("key", () -> gate);
+
+            IllegalArgumentException exception = assertThrows(
+                    IllegalArgumentException.class,
+                    () -> cache.getOrAddAsync("key", null));
+
+            assertEquals("ValueFactory cannot be null.", exception.getMessage());
+            assertEquals(1, cache.getPendingTasksCount());
+            assertFalse(inFlight.isDone());
+            gate.complete("value");
+            assertEquals("value", await(inFlight));
         }
     }
 
@@ -288,6 +321,56 @@ class SingleFactoryCallerTest {
                 release.countDown();
                 pool.shutdownNow();
             }
+        }
+
+        @Test
+        void surroundingSpaceDoesNotShareTheCall() throws Exception {
+            AtomicInteger calls = new AtomicInteger();
+            CompletableFuture<String> raw = new CompletableFuture<>();
+            CompletableFuture<String> padded = new CompletableFuture<>();
+
+            CompletableFuture<String> first = cache.getOrAddAsync("k", () -> {
+                calls.incrementAndGet();
+                return raw;
+            });
+            CompletableFuture<String> second = cache.getOrAddAsync(" k ", () -> {
+                calls.incrementAndGet();
+                return padded;
+            });
+
+            assertNotSame(first, second);
+            assertEquals(2, calls.get());
+            assertEquals(2, cache.getPendingTasksCount());
+            raw.complete("raw");
+            padded.complete("padded");
+            assertEquals("raw", await(first));
+            assertEquals("padded", await(second));
+        }
+
+        @Test
+        void sharesOneAsynchronousFailure() throws Exception {
+            AtomicInteger calls = new AtomicInteger();
+            CompletableFuture<String> gate = new CompletableFuture<>();
+            IllegalStateException failure = new IllegalStateException("later");
+
+            CompletableFuture<String> first = cache.getOrAddAsync("key", () -> {
+                calls.incrementAndGet();
+                return gate;
+            });
+            CompletableFuture<String> second = cache.getOrAddAsync("key", () -> {
+                calls.incrementAndGet();
+                return CompletableFuture.completedFuture("other");
+            });
+
+            assertSame(first, second);
+            assertEquals(1, calls.get());
+            assertEquals(1, cache.getPendingTasksCount());
+            gate.completeExceptionally(failure);
+            assertEquals(0, cache.getPendingTasksCount());
+            ExecutionException firstThrown = assertThrows(ExecutionException.class, () -> await(first));
+            ExecutionException secondThrown = assertThrows(ExecutionException.class, () -> await(second));
+            assertSame(failure, firstThrown.getCause());
+            assertSame(failure, secondThrown.getCause());
         }
 
         /**
@@ -516,6 +599,79 @@ class SingleFactoryCallerTest {
             secondGate.complete("new");
             assertEquals(0, cache.getPendingTasksCount());
             assertEquals("new", await(second));
+        }
+
+        @Test
+        void completedFactoryLeavesNoPendingEntry() throws Exception {
+            CompletableFuture<String> future = cache.getOrAddAsync(
+                    "key", () -> CompletableFuture.completedFuture("value"));
+
+            assertEquals(0, cache.getPendingTasksCount());
+            assertEquals("value", await(future));
+        }
+
+        @Test
+        void failedFutureLeavesNoPendingEntry() throws Exception {
+            IllegalStateException failure = new IllegalStateException("failed");
+
+            CompletableFuture<String> future = cache.getOrAddAsync(
+                    "key", () -> CompletableFuture.failedFuture(failure));
+
+            assertEquals(0, cache.getPendingTasksCount());
+            ExecutionException thrown = assertThrows(ExecutionException.class, () -> await(future));
+            assertSame(failure, thrown.getCause());
+        }
+
+        @Test
+        void nullFutureLeavesNoPendingEntry() throws Exception {
+            CompletableFuture<String> future = cache.getOrAddAsync("key", () -> null);
+
+            assertEquals(0, cache.getPendingTasksCount());
+            ExecutionException thrown = assertThrows(ExecutionException.class, () -> await(future));
+            assertInstanceOf(IllegalStateException.class, thrown.getCause());
+            assertEquals("ValueFactory returned null CompletableFuture", thrown.getCause().getMessage());
+        }
+
+        @Test
+        void runsFactoryAgainFromAFailureCallback() {
+            AtomicInteger calls = new AtomicInteger();
+            AtomicReference<CompletableFuture<String>> second = new AtomicReference<>();
+            CompletableFuture<String> gate = new CompletableFuture<>();
+            IllegalStateException failure = new IllegalStateException("fail");
+
+            CompletableFuture<String> first = cache.getOrAddAsync("key", () -> {
+                calls.incrementAndGet();
+                return gate;
+            });
+            first.whenComplete((value, error) -> second.set(cache.getOrAddAsync("key", () -> {
+                calls.incrementAndGet();
+                return CompletableFuture.completedFuture("again");
+            })));
+
+            gate.completeExceptionally(failure);
+
+            assertEquals(2, calls.get());
+            assertNotSame(first, second.get());
+            assertEquals(0, cache.getPendingTasksCount());
+        }
+
+        @Test
+        void clearOnEmptyCallerLeavesCountAtZero() {
+            assertEquals(0, cache.getPendingTasksCount());
+            cache.clear();
+            assertEquals(0, cache.getPendingTasksCount());
+        }
+
+        @Test
+        void clearThenCompletionDoesNotRestoreTheKey() throws Exception {
+            CompletableFuture<String> gate = new CompletableFuture<>();
+            CompletableFuture<String> future = cache.getOrAddAsync("key", () -> gate);
+
+            cache.clear();
+            gate.complete("value");
+
+            assertEquals("value", await(future));
+            assertEquals(0, cache.getPendingTasksCount());
         }
     }
 
