@@ -40,3 +40,12 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+
+### Coverage and mutation ###
+build/reports/jacoco/
+build/reports/pitest/
+build/pitHistory.txt
+
+### Local environment ###
+.env
+.env.*
