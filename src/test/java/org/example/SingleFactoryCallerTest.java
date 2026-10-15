@@ -574,6 +574,16 @@ class SingleFactoryCallerTest {
         }
 
         @Test
+        void clearDropsEveryInFlightEntry() {
+            cache.getOrAddAsync("a", CompletableFuture::new);
+            cache.getOrAddAsync("b", CompletableFuture::new);
+
+            assertEquals(2, cache.getPendingTasksCount());
+            cache.clear();
+            assertEquals(0, cache.getPendingTasksCount());
+        }
+
+        @Test
         void clearLeavesInFlightResultIntact() throws Exception {
             CompletableFuture<String> gate = new CompletableFuture<>();
             CompletableFuture<String> future = cache.getOrAddAsync("key", () -> gate);
